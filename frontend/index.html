@@ -6,7 +6,7 @@
 <title>实体键桥</title>
 <script src="/static/vue.global.prod.js"></script>
 <style>
-  :root{--bg:#1a1a1a;--panel:#111;--line:#333;--text:#f2f2f2;--muted:#9a9a9a;--accent:#ff7a18;--ok:#7CFC00;--bad:#ff4d4d}
+  :root{--bg:#1a1a1a;--panel:#111;--line:#333;--text:#f2f2f2;--muted:#9a9a9a;--accent:#ff7a18;--ok:#7CFC00;--bad:#ff4d4d;--warn:#ffd166}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI","PingFang SC",sans-serif}
   .top{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;background:#0d0d0d}
   .top h1{margin:0;font-size:20px;letter-spacing:.04em}
@@ -18,17 +18,24 @@
   .box{border:1px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px}
   .box h2{margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:700;letter-spacing:.08em;text-transform:uppercase}
   table{width:100%;border-collapse:collapse;font-size:12px;font-family:Consolas,monospace}
-  th,td{padding:8px 4px;border-bottom:1px solid #2a2a2a;text-align:left}
-  input{width:100%;background:#000;border:1px solid #444;color:#fff;padding:10px;font-family:Consolas,monospace;margin:6px 0 10px}
+  th,td{padding:8px 4px;border-bottom:1px solid #2a2a2a;text-align:left;vertical-align:top}
+  input,select{width:100%;background:#000;border:1px solid #444;color:#fff;padding:10px;font-family:Consolas,monospace;margin:6px 0 10px}
+  label{font-size:12px;color:var(--muted)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   .primary{background:var(--accent);color:#111;border:0;padding:10px 12px;font-weight:700;cursor:pointer;width:100%}
   .ghost{background:transparent;border:1px solid #666;color:#ddd;padding:6px 8px;cursor:pointer}
+  .mini{background:#000;border:1px solid #555;color:#ddd;padding:4px 8px;cursor:pointer;font-size:11px;margin:2px 4px 2px 0}
   .login{max-width:420px;margin:14vh auto;background:#111;border:1px solid #333;padding:22px}
-  .err{color:var(--bad);min-height:18px;font-size:12px}
+  .err{color:var(--bad);min-height:18px;font-size:12px;white-space:pre-wrap}
+  .note{color:var(--muted);font-size:12px;line-height:1.6}
   .pill{border:1px solid #444;padding:2px 6px;font-size:11px;color:var(--muted)}
-  .ok{color:var(--ok)}.bad{color:var(--bad)}
+  .pill.arch{border-color:var(--accent);color:var(--accent)}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
   .tabs{display:flex;gap:8px;margin-bottom:10px}
   .tabs button{background:#000;border:1px solid #333;color:#aaa;padding:6px 8px;cursor:pointer}
   .tabs button.on{border-color:var(--accent);color:var(--accent)}
+  .kv{font-family:Consolas,monospace;font-size:12px;color:#ddd}
+  .flash{border-left:3px solid var(--accent);padding:8px 10px;background:#000;font-size:12px;margin-bottom:10px;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -45,15 +52,19 @@ setTimeout(function () {
 </script>
 
 <script>
-const {createApp,ref,onMounted}=Vue;
+const {createApp,ref,computed,onMounted}=Vue;
 createApp({
   setup(){
     const token=ref(localStorage.getItem('keyremap_token')||'');
     const user=ref(localStorage.getItem('keyremap_user')||'');
-    const username=ref('admin'), password=ref('123456'), err=ref(''), actionErr=ref('');
+    const username=ref('admin'), password=ref('123456'), err=ref(''), flash=ref(''), actionErr=ref('');
     const leftTab=ref(0), rightTab=ref(0);
     const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
-    const oldKey=ref('OLD-B1');
+    const inbound=ref([]), summary=ref({counts:{},integrity:{},marks:[],trace:[],arch:''});
+    const tenantPart=ref(''), bizPart=ref('T1'), ingId=ref('');
+    const completeTenant=ref(''), completeBiz=ref('');
+    const verifying=ref(null), verifyErr=ref(''), completeRow=ref(null);
+    const busy=ref(false);
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -64,51 +75,155 @@ createApp({
       await refresh();
     }
     function logout(){token.value='';user.value='';localStorage.removeItem('keyremap_token');localStorage.removeItem('keyremap_user');}
-    async function loadJson(url){
-      const r=await fetch(url,{headers:auth()});
+    async function loadJson(url,opts){
+      const r=await fetch(url,Object.assign({headers:auth()},opts||{}));
       const j=await r.json().catch(()=>({}));
-      if(r.status===401){ logout(); return null; }
-      return j;
+      if(r.status===401){ logout(); return {_401:true}; }
+      return {status:r.status,ok:r.ok,body:j};
     }
     async function refresh(){
       if(!token.value) return;
-      const v=await loadJson('/api/map-versions'); if(v===null) return;
-      versions.value=Array.isArray(v.items)?v.items:[];
-      const m=await loadJson('/api/mappings'); if(m===null) return;
-      mappings.value=Array.isArray(m.items)?m.items:[];
-      const f=await loadJson('/api/formal'); if(f===null) return;
-      formal.value=Array.isArray(f.items)?f.items:[];
-      const c=await loadJson('/api/conflicts'); if(c===null) return;
-      conflicts.value=Array.isArray(c.items)?c.items:[];
+      const v=await loadJson('/api/map-versions'); if(v._401) return;
+      versions.value=v.body.items||[];
+      const m=await loadJson('/api/mappings'); mappings.value=m.body.items||[];
+      const f=await loadJson('/api/formal'); formal.value=f.body.items||[];
+      const c=await loadJson('/api/conflicts'); conflicts.value=c.body.items||[];
+      const i=await loadJson('/api/src-parts/inbound'); inbound.value=i.body.items||[];
+      const s=await loadJson('/api/src-parts/summary'); if(!s._401) summary.value=s.body;
     }
-    async function doRemap(){
-      actionErr.value='';
-      const r=await fetch('/api/remap',{method:'POST',headers:auth(),body:JSON.stringify({old_key:oldKey.value})});
-      const j=await r.json(); actionErr.value=r.ok?('正式键 '+j.entity_key):(j.detail||'失败');
+    const arch=computed(()=>summary.value.arch||'');
+    const archLabel=computed(()=>summary.value.arch_label||'');
+    const criterion=computed(()=>summary.value.criterion||'');
+    const integrityBad=computed(()=>{
+      const g=summary.value.integrity||{};
+      return Object.values(g).some(n=>Number(n)!==0);
+    });
+    function brief(x){return (x.tenant_part||'∅')+' / '+(x.biz_part||'∅');}
+    async function doIngest(){
+      actionErr.value=''; busy.value=true;
+      const body={tenant_part:tenantPart.value,biz_part:bizPart.value};
+      if(ingId.value.trim()) body.ingest_id=ingId.value.trim();
+      const r=await loadJson('/api/src-parts/ingest',{method:'POST',body:JSON.stringify(body)});
+      busy.value=false;
+      if(r._401) return;
+      if(!r.ok){actionErr.value=(r.body.detail||'入站失败'); return;}
+      flash.value='已入站 '+r.body.ingest_id+'：'+(r.body.complete?'分段齐套，可重映':'缺段，入站留待补段')
+        +'\n证据已写入 src_part_ledger（seq='+r.body.ledger_seq+'），页面不拼接键。';
+      ingId.value='';
       await refresh();
     }
+    async function doRemap(row){
+      actionErr.value=''; flash.value='';
+      const r=await loadJson('/api/src-parts/remap?ingest_id='+encodeURIComponent(row.ingest_id),{method:'POST'});
+      if(r._401) return;
+      if(!r.ok){ actionErr.value=(r.body.detail&&r.body.detail.detail)||r.body.detail||'重映被拒'; }
+      else {
+        const p=r.body;
+        flash.value='重映通过：'+p.ingest_id+' → '+p.entity_key
+          +'\n口径：'+p.arch_label+'；桶：'+p.bucket
+          +(p.missing_mark_id?('\n缺段标记 #'+p.missing_mark_id+'（'+p.missing.join(',')+'）'):'');
+      }
+      await refresh();
+    }
+    async function doComplete(row){
+      actionErr.value='';
+      const body={expected_rev:row.rev};
+      if(completeTenant.value) body.tenant_part=completeTenant.value;
+      if(completeBiz.value) body.biz_part=completeBiz.value;
+      const r=await loadJson('/api/src-parts/complete?ingest_id='+encodeURIComponent(row.ingest_id),{method:'POST',body:JSON.stringify(body)});
+      if(r._401) return;
+      if(!r.ok){ actionErr.value=(r.body.detail&&r.body.detail.detail)||r.body.detail||'补段失败'; }
+      else flash.value='补段成功：rev '+row.rev+' → '+r.body.rev+'（追加证据 seq='+r.body.ledger_seq+'）';
+      completeTenant.value=''; completeBiz.value='';
+      await refresh();
+    }
+    async function verify(id){
+      verifyErr.value=''; verifying.value=null;
+      const r=await loadJson('/api/src-parts/ingest/'+encodeURIComponent(id));
+      if(r._401) return;
+      if(!r.ok){verifyErr.value=r.body.detail||'核证失败';return;}
+      verifying.value=r.body;
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,flash,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,
+      inbound,summary,tenantPart,bizPart,ingId,completeTenant,completeBiz,completeRow,verifying,verifyErr,busy,
+      arch,archLabel,criterion,integrityBad,brief,login,logout,doIngest,doRemap,doComplete,verify,refresh};
   },
   template:`
   <div v-if="!token" class="login">
     <h1 style="margin-top:0">实体键<em style="color:#ff7a18;font-style:normal">桥</em></h1>
-    <p style="color:#9a9a9a">左侧映射，右侧正式区与冲突。入站旧键必须先重映。</p>
+    <p class="note">入站租户号与业务号分开上传，分段证据先落库，再由重映闸按单一口径出正式键。</p>
     <label>用户名</label><input v-model="username"/><label>密码</label><input type="password" v-model="password"/>
     <div class="err">{{err}}</div><button class="primary" @click="login">接通键桥</button>
   </div>
   <div v-if="token">
     <div class="top">
-      <h1>实体键<em>桥</em> <span class="pill">旧键 → 正式键</span></h1>
+      <h1>实体键<em>桥</em>
+        <span class="pill">旧键 → 正式键</span>
+        <span class="pill arch">{{archLabel||'口径未装载'}}</span>
+        <span class="pill" :class="{bad:integrityBad}">{{integrityBad?'互证不一致':'互证一致'}}</span>
+      </h1>
       <div>{{user}} <button class="ghost" @click="logout">退出</button></div>
     </div>
     <div class="split">
       <div class="pane">
         <div class="tabs">
-          <button :class="{on:leftTab===0}" @click="leftTab=0">映射版本</button>
-          <button :class="{on:leftTab===1}" @click="leftTab=1">执行重映</button>
+          <button :class="{on:leftTab===0}" @click="leftTab=0">入站装载台</button>
+          <button :class="{on:leftTab===1}" @click="leftTab=1">重映闸</button>
+          <button :class="{on:leftTab===2}" @click="leftTab=2">映射版本</button>
         </div>
+        <div class="flash" v-if="flash">{{flash}}</div>
+        <div class="err">{{actionErr}}</div>
+
         <div class="box" v-show="leftTab===0">
+          <h2>Ingress · 分段上传</h2>
+          <div class="row">
+            <div><label>tenant_part（租户号）</label><input v-model="tenantPart" placeholder="留空即缺租户段"/></div>
+            <div><label>biz_part（业务号）</label><input v-model="bizPart"/></div>
+          </div>
+          <label>ingest_id（可选，留空自动生成）</label><input v-model="ingId" placeholder="ing-xxxx"/>
+          <button class="primary" :disabled="busy" @click="doIngest">写入入站并落分段证据</button>
+          <p class="note">键由服务端从两段生成并写入 src_part_ledger；页面不保存拼好的键，核证接口只读。</p>
+          <h2 style="margin-top:14px">Inbound</h2>
+          <table><thead><tr><th>ingest</th><th>分段</th><th>状态</th><th>rev</th></tr></thead>
+          <tbody>
+            <tr v-for="x in inbound" :key="x.ingest_id">
+              <td>{{x.ingest_id}}</td>
+              <td><span :class="x.complete?'ok':'warn'">{{brief(x)}}</span></td>
+              <td>{{x.status}}</td><td>{{x.rev}}</td>
+            </tr>
+            <tr v-if="!inbound.length"><td colspan="4" class="note">尚无入站行</td></tr>
+          </tbody></table>
+        </div>
+
+        <div class="box" v-show="leftTab===1">
+          <h2>Remap Gate · {{archLabel}}</h2>
+          <p class="note">{{criterion}}</p>
+          <table><thead><tr><th>ingest</th><th>分段</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr v-for="x in inbound" :key="x.ingest_id">
+              <td>{{x.ingest_id}}</td>
+              <td><span :class="x.complete?'ok':'warn'">{{brief(x)}}</span><div class="note" v-if="x.missing.length">缺：{{x.missing.join(', ')}}</div></td>
+              <td>{{x.status}}</td>
+              <td>
+                <button class="mini" @click="doRemap(x)">重映</button>
+                <button class="mini" @click="verify(x.ingest_id)">核证</button>
+                <button class="mini" v-if="x.status==='待补段'" @click="completeTenant=x.tenant_part||'',completeBiz=x.biz_part||'',completeRow=x">补段…</button>
+              </td>
+            </tr>
+          </tbody></table>
+          <div v-if="completeRow" class="box" style="margin-top:10px;border-color:#666">
+            <h2>补段 · {{completeRow.ingest_id}} (rev {{completeRow.rev}})</h2>
+            <div class="row">
+              <div><label>tenant_part</label><input v-model="completeTenant"/></div>
+              <div><label>biz_part</label><input v-model="completeBiz"/></div>
+            </div>
+            <button class="primary" @click="doComplete(completeRow);completeRow=null">追加分段证据</button>
+          </div>
+          <p class="note">补段与重映共用同一写锁；携带 rev 才会写入，rev 过期返回争用留痕。</p>
+        </div>
+
+        <div class="box" v-show="leftTab===2">
           <h2>Map Versions</h2>
           <table><thead><tr><th>version</th><th>status</th><th>from</th></tr></thead>
           <tbody><tr v-for="v in versions" :key="v.id"><td>{{v.version}}</td><td>{{v.status}}</td><td>{{v.effective_from}}</td></tr></tbody></table>
@@ -116,29 +231,80 @@ createApp({
           <table><thead><tr><th>old</th><th>new</th><th>kind</th></tr></thead>
           <tbody><tr v-for="m in mappings" :key="m.id"><td>{{m.old_key}}</td><td class="ok">{{m.new_key}}</td><td>{{m.kind}}</td></tr></tbody></table>
         </div>
-        <div class="box" v-show="leftTab===1">
-          <h2>Ingress Remap</h2>
-          <label>old_key</label>
-          <input v-model="oldKey"/>
-          <button class="primary" @click="doRemap">重映入正式区</button>
-          <div class="err">{{actionErr}}</div>
-        </div>
       </div>
+
       <div class="bridge"></div>
+
       <div class="pane">
         <div class="tabs">
           <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
-          <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===1}" @click="rightTab=1">互证桶 / 缺段标记</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2">冲突队列</button>
+          <button :class="{on:rightTab===3}" @click="rightTab=3">只读核证</button>
         </div>
+
         <div class="box" v-show="rightTab===0">
           <h2>Formal Zone</h2>
-          <table><thead><tr><th>entity</th><th>from</th><th>ver</th><th>at</th></tr></thead>
-          <tbody><tr v-for="f in formal" :key="f.id"><td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td><td>{{f.version}}</td><td>{{f.created_at}}</td></tr></tbody></table>
+          <table><thead><tr><th>entity</th><th>from</th><th>分段</th><th>ver</th><th>at</th></tr></thead>
+          <tbody><tr v-for="f in formal" :key="f.id">
+            <td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td>
+            <td :class="f.part_state==='齐套'?'ok':'warn'">{{f.part_state}}</td>
+            <td>{{f.version}}</td><td>{{f.created_at}}</td></tr></tbody></table>
         </div>
+
         <div class="box" v-show="rightTab===1">
+          <h2>互证桶</h2>
+          <div class="kv">
+            齐套桶：{{summary.counts.complete_bucket||0}} ·
+            缺段桶：{{summary.counts.degraded_bucket||0}} ·
+            缺段标记：{{summary.counts.missing_marks||0}} ·
+            待补段入站：{{summary.counts.inbound_waiting_parts||0}}
+          </div>
+          <div class="err" v-if="integrityBad">
+            互证不一致：缺段混入齐套桶 {{summary.integrity.degraded_in_complete_bucket}}，
+            缺段无标记 {{summary.integrity.unmarked_degraded_formal}}
+          </div>
+          <table style="margin-top:10px"><thead><tr><th>ingest</th><th>缺段</th><th>使用键</th><th>at</th></tr></thead>
+          <tbody><tr v-for="m in summary.marks" :key="m.id">
+            <td>{{m.ingest_id}}</td><td class="warn">{{m.missing_part}}</td><td>{{m.canon_used}}</td><td>{{m.created_at}}</td></tr>
+            <tr v-if="!(summary.marks||[]).length"><td colspan="4" class="note">无缺段标记（当前口径下缺段不出键）</td></tr>
+          </tbody></table>
+          <h2 style="margin-top:14px">写入留痕</h2>
+          <table><thead><tr><th>route</th><th>ingest</th><th>outcome</th><th>at</th></tr></thead>
+          <tbody><tr v-for="t in summary.trace" :key="t.id">
+            <td>{{t.route}}</td><td>{{t.ingest_id||'—'}}</td>
+            <td :class="t.outcome==='ok'?'ok':(t.outcome==='contention'?'warn':'bad')">{{t.outcome}}</td>
+            <td>{{t.at}}</td></tr></tbody></table>
+        </div>
+
+        <div class="box" v-show="rightTab===2">
           <h2>Conflicts</h2>
           <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
           <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
+        </div>
+
+        <div class="box" v-show="rightTab===3">
+          <h2>分段齐套核证（只读连接）</h2>
+          <div class="err">{{verifyErr}}</div>
+          <div v-if="verifying" class="kv">
+            <div>ingest：{{verifying.ingest_id}} · 状态：{{verifying.inbound.status}} · rev：{{verifying.inbound.rev}}</div>
+            <div>口径：{{verifying.arch_label}} · 证据形态：{{verifying.evidence_form}}</div>
+            <div>当前分段：{{verifying.current.tenant_part||'∅'}} / {{verifying.current.biz_part||'∅'}}
+              · 齐套：<span :class="verifying.current.complete?'ok':'warn'">{{verifying.current.complete?'是':'否'}}</span></div>
+            <div>查键：{{verifying.current.lookup_key||'—'}}
+              · 映射：<span :class="verifying.mapping&&verifying.mapping.found?'ok':'bad'">{{verifying.mapping&&verifying.mapping.found?(verifying.mapping.new_key+' ('+verifying.mapping.kind+')'):'无映射'}}</span></div>
+            <div>证据事件：{{verifying.ledger.length}} 条 · 正式行：{{verifying.formal.length}} 条 · 桶：{{verifying.bucket?verifying.bucket.bucket:'未入桶'}}</div>
+            <div>互证核对：齐套桶 {{verifying.counts.complete_bucket}}，缺段桶 {{verifying.counts.degraded_bucket}}，
+              缺段标记 {{verifying.counts.missing_marks}}，未入桶正式行 {{verifying.counts.unbucketed_formal}}</div>
+            <div :class="Object.values(verifying.integrity).some(n=>n!==0)?'bad':'ok'">
+              不变量：{{Object.values(verifying.integrity).every(n=>n===0)?'全部通过':'存在违例'}}
+            </div>
+          </div>
+          <table style="margin-top:10px"><thead><tr><th>seq</th><th>tenant</th><th>biz</th><th>canon</th><th>source</th></tr></thead>
+          <tbody><tr v-for="e in (verifying?verifying.ledger:[])" :key="e.id">
+            <td>{{e.seq}}</td><td>{{e.tenant_part||'∅'}}</td><td>{{e.biz_part||'∅'}}</td>
+            <td>{{e.canon_old||'—'}}</td><td>{{e.source}}</td></tr></tbody></table>
+          <p class="note" v-if="!verifying">在上方重映闸点“核证”，或加 ?ingest_id= 直接 GET /api/src-parts/ingest/{id}。</p>
         </div>
       </div>
     </div>
